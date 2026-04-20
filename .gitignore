@@ -1,0 +1,27 @@
+# Virtual environments
+venv/
+simulation/venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+
+# Upstream reference (clone separately: https://github.com/RL4H/G2P2C/tree/multichain)
+simulation/G2P2C/
+
+# Large downloads
+get-pip.py
+repo.zip
+repo.txt
+*.pdf
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

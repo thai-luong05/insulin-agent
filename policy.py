@@ -1,0 +1,32 @@
+import torch
+import torch.nn as nn
+from others import LSTMEncoder, NormedLinear
+
+
+class Policy(nn.Module):
+    """Continuous action policy: outputs Normal(mu, sigma) over action in [-1, 1].
+    Pump rate = action_scale * exp((action - 1) * 4)  (handled in Agent)."""
+    def __init__(self, n_features, n_hidden=16, n_layers=1):
+        super().__init__()
+        self.encoder = LSTMEncoder(n_features, n_hidden, n_layers)
+        d = self.encoder.output_dim
+        self.net = nn.Sequential(
+            nn.Linear(d, d * 2), nn.ReLU(),
+            nn.Linear(d * 2, d * 2), nn.ReLU(),
+            nn.Linear(d * 2, d * 2), nn.ReLU(),
+        )
+        self.mu_head    = NormedLinear(d * 2, 1, scale=0.1)
+        self.sigma_head = NormedLinear(d * 2, 1, scale=0.1)
+        # Init mu so tanh(mu)≈-0.5 at start → pump ≈ scale·exp(-6) (near basal for adult when scale=5).
+        # Without this, tanh init ≈ 0 → pump = scale·exp(-4) ≈ 7× basal → early hypo before policy learns.
+        self.mu_head.bias.data.fill_(-0.549)
+
+    def forward(self, x):
+        h = self.net(self.encoder(x))
+        mu    = torch.tanh(self.mu_head(h)).squeeze(-1)
+        sigma = torch.sigmoid(self.sigma_head(h)).squeeze(-1) + 1e-3
+        return mu, sigma
+
+    def get_dist(self, x):
+        mu, sigma = self.forward(x)
+        return torch.distributions.Normal(mu, sigma)
