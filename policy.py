@@ -6,7 +6,7 @@ from others import LSTMEncoder, NormedLinear
 class Policy(nn.Module):
     """Continuous action policy: outputs Normal(mu, sigma) over action in [-1, 1].
     Pump rate = action_scale * exp((action - 1) * 4)  (handled in Agent)."""
-    def __init__(self, n_features, n_hidden=16, n_layers=1):
+    def __init__(self, n_features, n_hidden=16, n_layers=1, init_mu_bias=0.0):
         super().__init__()
         self.encoder = LSTMEncoder(n_features, n_hidden, n_layers)
         d = self.encoder.output_dim
@@ -17,9 +17,9 @@ class Policy(nn.Module):
         )
         self.mu_head    = NormedLinear(d * 2, 1, scale=0.1)
         self.sigma_head = NormedLinear(d * 2, 1, scale=0.1)
-        # Init mu so tanh(mu)≈-0.5 at start → pump ≈ scale·exp(-6) (near basal for adult when scale=5).
-        # Without this, tanh init ≈ 0 → pump = scale·exp(-4) ≈ 7× basal → early hypo before policy learns.
-        self.mu_head.bias.data.fill_(-0.549)
+        # Init pre-tanh bias so initial pump ≈ basal (caller computes from basal/action_scale).
+        # Default 0 reproduces vanilla init; main.py overrides per patient.
+        self.mu_head.bias.data.fill_(init_mu_bias)
 
     def forward(self, x):
         h = self.net(self.encoder(x))

@@ -313,7 +313,10 @@ def main():
 
     std_basal = get_basal(patient)
     args.action_scale = 5.0
-    print(f'basal={std_basal:.5f} U/min  action_scale={args.action_scale}')
+    # Bias policy so initial pump ≈ basal: tanh(b) = 1 + ln(basal/scale)/4, clipped for numerical safety.
+    init_a = float(np.clip(1 + np.log(std_basal / args.action_scale) / 4, -0.95, 0.95))
+    init_mu_bias = float(np.arctanh(init_a))
+    print(f'basal={std_basal:.5f} U/min  action_scale={args.action_scale}  init_mu_bias={init_mu_bias:.3f}')
 
     agent = Agent(
         n_features   = n_features,
@@ -331,6 +334,7 @@ def main():
         n_epochs     = 5,
         target_kl        = 0.01,
         normalize_reward = True,
+        init_mu_bias     = init_mu_bias,
     )
 
     # 2800 episodes x 288 steps ≈ 800k transitions
@@ -465,7 +469,9 @@ def main_all(n_episodes=400):
 
         std_basal = get_basal(patient)
         args.action_scale = 5.0
-        print(f'  basal={std_basal:.5f} U/min  action_scale={args.action_scale}')
+        init_a = float(np.clip(1 + np.log(std_basal / args.action_scale) / 4, -0.95, 0.95))
+        init_mu_bias = float(np.arctanh(init_a))
+        print(f'  basal={std_basal:.5f} U/min  action_scale={args.action_scale}  init_mu_bias={init_mu_bias:.3f}')
 
         agent = Agent(
             n_features   = n_features,
@@ -483,6 +489,7 @@ def main_all(n_episodes=400):
             n_epochs     = 5,
             target_kl        = 0.01,
             normalize_reward = True,
+            init_mu_bias     = init_mu_bias,
         )
 
         reward_history = train_loop(agent, env, args, n_episodes=n_episodes)

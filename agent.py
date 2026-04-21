@@ -36,7 +36,8 @@ class Agent:
                  gamma=0.99, lambda_=0.95,
                  entropy_coef=0.01, grad_clip=20,
                  eps_clip=0.2, n_epochs=5,
-                 target_kl=0.01, normalize_reward=True):
+                 target_kl=0.01, normalize_reward=True,
+                 init_mu_bias=0.0):
 
         self.device       = torch.device(device)
         self.action_scale = action_scale
@@ -50,7 +51,8 @@ class Agent:
         self.normalize_reward  = normalize_reward
         self.reward_normalizer = RewardNormalizer(gamma=gamma) if normalize_reward else None
 
-        self.policy = Policy(n_features, n_hidden, n_layers).to(self.device)
+        self.policy = Policy(n_features, n_hidden, n_layers,
+                             init_mu_bias=init_mu_bias).to(self.device)
         self.value  = Value_function(n_features, n_hidden, n_layers).to(self.device)
 
         self.opt_pi     = optim.Adam(self.policy.parameters(), lr=pi_lr)
