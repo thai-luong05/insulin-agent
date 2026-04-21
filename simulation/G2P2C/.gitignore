@@ -1,0 +1,8 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyc
+results/
+experiments/nci/
+.env
+experiments/nci/help.txt

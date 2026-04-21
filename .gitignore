@@ -10,9 +10,6 @@ __pycache__/
 # Environment
 .env
 
-# Upstream reference (clone separately: https://github.com/RL4H/G2P2C/tree/multichain)
-simulation/G2P2C/
-
 # Large downloads
 get-pip.py
 repo.zip
