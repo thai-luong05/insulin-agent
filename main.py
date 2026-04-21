@@ -24,7 +24,7 @@ if MAIN_PATH is None:
     except: MAIN_PATH = None
 if MAIN_PATH is None:
     MAIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             '..', 'simulation', 'G2P2C')
+                         'simulation', 'G2P2C')
 if MAIN_PATH not in sys.path:
     sys.path.insert(0, MAIN_PATH)
 
