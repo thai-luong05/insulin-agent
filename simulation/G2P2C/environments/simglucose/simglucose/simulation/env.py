@@ -71,14 +71,14 @@ class T1DSimEnv(object):
         insulin = 0.0
         BG = 0.0
         CGM = 0.0
-
-        for _ in range(int(self.sample_time)):
+        #Fix for 75 - 81 to cap insulin limit
+        for i in range(int(self.sample_time)):
+            insulin_minute = min(insulin_policy_sum, infusion_minute_max)
+            insulin_policy_sum = max(insulin_policy_sum - insulin_minute,0.)
             # Compute moving average as the sample measurements
-            tmp_CHO, tmp_insulin, tmp_BG, tmp_CGM = self.mini_step(action)
-            CHO += tmp_CHO / self.sample_time
-            insulin += tmp_insulin / self.sample_time
-            BG += tmp_BG / self.sample_time
-            CGM += tmp_CGM / self.sample_time
+            tmp_CHO, tmp_insulin, tmp_BG, tmp_CGM = self.mini_step(insulin_minute)
+            CHO += tmp_CHO
+            insulin += tmp_insulin
 
         # Compute risk index
         horizon = 1
