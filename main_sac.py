@@ -1,9 +1,4 @@
-"""SAC-only entry point — no MPC.
-
-Use this if you want to run the original SAC setup without MPC:
-    python main_sac.py --patient_id 0 --action_scale 5.0
-
-main.py is the SAC+MPC version per Qunwei's suggestion.
+"""Running SAC algo
 """
 import os, sys, random, torch
 import numpy as np
@@ -29,7 +24,7 @@ from utils.pumpAction import Pump, get_basal
 
 GLUCOSE_MIN, GLUCOSE_MAX = 39, 600
 
-
+#modify reward
 def clinical_reward(cgm, prev_cgm=None):
     if cgm < 54:
         return -15.0
