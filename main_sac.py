@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 from decouple import config
 from agent_sac import SACAgent
 
-# ── path setup ────────────────────────────────────────────────────────────────
 MAIN_PATH = os.environ.get('MAIN_PATH')
 if MAIN_PATH is None:
     try:    MAIN_PATH = config('MAIN_PATH')
