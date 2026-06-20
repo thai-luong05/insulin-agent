@@ -1,9 +1,39 @@
-"""pure mpc controller for glucose regulation."""
+# Pure Bergman-MPC glucose regulation using simglucose's ground-truth per-patient clinical params (CF=ISF, CR=ICR, TDI=TDD) from Quest.csv instead of the 1700/450 population rules.
 import os, sys, random
+import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from decouple import config
-from mpc_controller import MPCController, IOB_GAMMA
+from bergman_controller import BergmanMPC
+
+
+#simglucose ships per-patient clinical params (CF=ISF, CR=ICR, TDI=TDD)
+_QUEST_CSV = os.path.join(os.path.dirname(__file__),
+                          'venv', 'Lib', 'site-packages',
+                          'simglucose', 'params', 'Quest.csv')
+_quest_df = None
+
+def get_clinical_params(patient_name):
+    """Return (isf, icr, tdd, age) for a patient from simglucose's Quest.csv."""
+    global _quest_df
+    if _quest_df is None:
+        _quest_df = pd.read_csv(_QUEST_CSV).set_index('Name')
+    row = _quest_df.loc[patient_name]
+    return {'isf': float(row['CF']), 'icr': float(row['CR']),
+            'tdd': float(row['TDI']), 'age': int(row['Age'])}
+
+
+_VPATIENT_CSV = os.path.join(os.path.dirname(__file__),
+                             'venv', 'Lib', 'site-packages',
+                             'simglucose', 'params', 'vpatient_params.csv')
+_vpatient_df = None
+
+def get_body_weight(patient_name):
+    """Patient body weight in kg from simglucose's vpatient_params.csv."""
+    global _vpatient_df
+    if _vpatient_df is None:
+        _vpatient_df = pd.read_csv(_VPATIENT_CSV).set_index('Name')
+    return float(_vpatient_df.loc[patient_name, 'BW'])
 
 MAIN_PATH = os.environ.get('MAIN_PATH')
 if MAIN_PATH is None:
@@ -45,56 +75,69 @@ def calibrate(env, ss, args, pump):
     return state_matrix, s.CGM
 
 
-PREBOLUS_STEPS = 3  #15 min meal pre-announce
+PREBOLUS_STEPS         = 3      #15 min meal pre-announce
+PUMP_PHYSICAL_MAX      = 0.6    #U/min absolute pump cap (matches env)
 
 
-def run_episode(mpc, env, args, pump):
-    """24h mpc rollout (288 steps × 5 min)."""
+def run_episode(mpc, env, args, pump, true_cr, prebolus_steps=PREBOLUS_STEPS):
+    # 24h closed-loop rollout (288 x 5 min): meals covered open-loop by a (carbs/true_cr) bolus queued prebolus_steps ahead and delivered at the pump cap, while the Bergman MPC runs as pure correction (meal_carbs=0)
     ss = StateSpace(args)
-    state_matrix, current_cgm = calibrate(env, ss, args, pump)
+    _, current_cgm = calibrate(env, ss, args, pump)
 
-    #iob at basal steady state
-    i_eff          = mpc.egp / mpc.alpha
-    prev_meal_carbs = 0.0
+    #bergman insulin states, tracked externally across the rollout
+    X_now = 0.0     #insulin action (1/min)
+    I_now = 0.0     #plasma insulin deviation from basal (mU/L)
 
-    #step-indexed meal schedule for pre-bolus lookahead
+    #step-indexed meal schedule for the feedforward bolus
     try:
         sched = env.env.scenario.scenario.get('meal', {'time': [], 'amount': []})
-        meal_steps  = [t / 5.0 - args.calibration
-                       for t in sched['time']]
+        meal_steps   = [t / 5.0 - args.calibration for t in sched['time']]
         meal_amounts = [float(a) for a in sched['amount']]
     except Exception:
         meal_steps, meal_amounts = [], []
 
     rewards, cgm_trace, ins_trace, infos = [], [], [], []
 
-    for step in range(288):
-        #pre-bolus if a meal starts within PREBOLUS_STEPS
-        lookahead_carbs = 0.0
-        for ms, ma in zip(meal_steps, meal_amounts):
-            if step < ms <= step + PREBOLUS_STEPS:
-                lookahead_carbs = ma
-                break
-        meal_carbs_for_mpc = max(prev_meal_carbs, lookahead_carbs)
+    bolus_queue = 0.0    #units of insulin queued for delivery
+    bolused     = set()
 
-        #use real cgm from env, not state_matrix (normalisation isn't reversible)
-        pump_act = mpc.compute_insulin(
+    for step in range(288):
+        #queue the meal bolus once, when the meal enters the prebolus window
+        for idx, (ms, ma) in enumerate(zip(meal_steps, meal_amounts)):
+            if idx not in bolused and step <= ms <= step + prebolus_steps:
+                bolus_queue += ma / float(true_cr)
+                bolused.add(idx)
+
+        #MPC handles correction only; meals are covered by the bolus queue
+        mpc_rate = mpc.compute_insulin(
             G_now      = current_cgm,
-            I_eff      = i_eff,
+            X_now      = X_now,
+            I_now      = I_now,
             G_target   = mpc.bg_target,
-            meal_carbs = meal_carbs_for_mpc,
+            meal_carbs = 0.0,
         )
+
+        #drain the bolus queue at the pump cap, on top of the correction rate
+        if bolus_queue > 0:
+            from_queue  = min(bolus_queue / 5.0, mpc.u_max)
+            bolus_queue = max(0.0, bolus_queue - from_queue * 5.0)
+            pump_act    = min(mpc.u_max, mpc_rate + from_queue)
+        else:
+            pump_act = mpc_rate
 
         s, reward, _, info = env.step(pump_act)
         current_cgm = s.CGM
 
-        state_matrix, _ = ss.update(
+        ss.update(
             cgm=s.CGM, ins=pump_act, meal=info['remaining_time'],
             hour=step + 1, meal_type=info['meal_type'], carbs=info['future_carb'],
         )
 
-        i_eff           = IOB_GAMMA * i_eff + pump_act * 5
-        prev_meal_carbs = info.get('future_carb', 0.0)
+        #advance the external Bergman insulin states for next step's prediction
+        dI = -mpc.n * I_now + 1000.0 * (pump_act - mpc.u_basal) / mpc.V_I
+        dX = -mpc.p2 * X_now + mpc.p3 * I_now
+        I_now = I_now + mpc.dt * dI
+        X_now = X_now + mpc.dt * dX
 
         rewards.append(reward)
         cgm_trace.append(s.CGM)
@@ -137,8 +180,8 @@ def plot_results(eval_trace, patient_id, cmd=None):
     ax.axhspan(70, 180, color='limegreen', alpha=0.15, label='Target (70-180)')
     ax.axhline(70,  color='orange', lw=1, ls='--', alpha=0.7)
     ax.axhline(180, color='orange', lw=1, ls='--', alpha=0.7)
-    ax.axhline(54,  color='red', lw=1, ls=':', alpha=0.6, label='Severe hypo (54)')
-    ax.axhline(250, color='red', lw=1, ls=':', alpha=0.6, label='Severe hyper (250)')
+    ax.axhline(50,  color='red', lw=1, ls=':', alpha=0.6, label='Severe hypo (50)')
+    ax.axhline(300, color='red', lw=1, ls=':', alpha=0.6, label='Severe hyper (300)')
     ax.plot(steps, cgm, 'b-', lw=2, label='CGM')
     bg_target = eval_trace.get('bg_target', 110.0)
     ax.axhline(bg_target, color='green', lw=1, ls='--', alpha=0.8, label=f'MPC target ({bg_target:.0f})')
@@ -165,100 +208,121 @@ def plot_results(eval_trace, patient_id, cmd=None):
     return fig
 
 
-def main():
-    args = Options().parse()
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+def default_max_bolus_mult(patient_id):
+    if patient_id >= 20: return 30.0
+    if patient_id < 10:  return 25.0
+    return 15.0
+
+
+def evaluate_patient(patient_id, overrides=None, seed=0, verbose=True):
+    # One 24h hybrid rollout (open-loop carb-ratio meal bolus + Bergman correction MPC) with optional RL overrides; returns TIR/hypo/hyper metrics + traces. Override keys: isf_mult, correction_target_offset, max_bolus_mult, R_log10, beta, p2, horizon, prebolus_steps, cr_mult.
+    overrides = overrides or {}
+
+    saved_argv = sys.argv
+    sys.argv = [saved_argv[0]]
+    try:
+        args = Options().parse()
+    finally:
+        sys.argv = saved_argv
+    args.patient_id = patient_id
+    args.seed = seed
+    random.seed(seed); np.random.seed(seed)
 
     patients, env_ids = get_patient_env()
-    patient = patients[args.patient_id]
-    env_id  = env_ids[args.patient_id]
-    env = get_env(args, patient_name=patient, env_id=env_id,
-                  custom_reward=custom_reward, seed=args.seed)
-    print('meal scenario:', env.env.scenario.scenario['meal'])
+    patient = patients[patient_id]
+
+    # children: scale meals to ~3.5 g/kg/day (proportions [30,15,45,15,45,15] across meals+snacks)
+    if 10 <= patient_id < 20:
+        bw_kg          = get_body_weight(patient)
+        target_total_g = 3.5 * bw_kg
+        proportions    = [30, 15, 45, 15, 45, 15]
+        scale          = target_total_g / sum(proportions)
+        args.meal_amount   = [max(5, round(p * scale)) for p in proportions]
+        args.meal_variance = [max(1, round(a / 6))   for a in args.meal_amount]
+
+    import gym.envs.registration as _reg
+    _reg.registry.env_specs.pop(env_ids[patient_id], None)
+    env = get_env(args, patient_name=patient, env_id=env_ids[patient_id],
+                  custom_reward=custom_reward, seed=seed)
 
     std_basal = get_basal(patient)
-    print(f'patient={patient}  basal={std_basal:.5f} U/min')
+    clin      = get_clinical_params(patient)
+    tdd       = clin['tdd']
+    isf       = (1700.0 / tdd) * float(overrides.get('isf_mult', 1.0))
+    cr_mult   = float(overrides.get('cr_mult', 1.0))
+    true_cr   = clin['icr'] * cr_mult              #ground-truth CR for feedforward bolus
+    icr       = 450.0  / tdd                        #reported for the metrics dict only
+    mb_mult   = float(overrides.get('max_bolus_mult', default_max_bolus_mult(patient_id)))
+    R_val     = 10.0 ** float(overrides.get('R_log10', -2.0))
+    horizon   = int(overrides.get('horizon', 24))
+    prebolus  = int(overrides.get('prebolus_steps', 5))
+    body_kg   = get_body_weight(patient)
+    basal_bg0 = float(env.reset().CGM)
 
-    #1700 rule: ISF=1700/TDD, TDD=basal*1440, alpha=ISF/25
-    tdd   = std_basal * 1440.0
-    isf   = 1700.0 / tdd
-    alpha = isf / 25.0
-    print(f'TDD={tdd:.2f} U/day  ISF={isf:.1f} mg/dL/U  alpha={alpha:.3f}')
-
-    #patient-type bolus ceiling
-    if args.patient_id >= 20:
-        max_bolus_mult = 30.0
-    elif args.patient_id < 10:
-        max_bolus_mult = 25.0
-    else:
-        max_bolus_mult = 15.0
-
-    mpc = MPCController(basal_rate=std_basal, alpha=alpha,
-                        max_bolus_multiplier=max_bolus_mult)
-    mpc.basal_bg  = float(env.reset().CGM)
-    #target just below resting bg to avoid fasting over-correction
-    mpc.bg_target = max(110.0, mpc.basal_bg - 10.0)
-    print(f'MPC ready  basal_bg={mpc.basal_bg:.1f}  bg_target={mpc.bg_target:.1f} mg/dL')
-    print(f'           egp={mpc.egp:.4f}  alpha={mpc.alpha:.3f}  gamma={mpc.gamma}  beta={mpc.beta}')
+    beta_val = float(overrides.get('beta', 3.0))
+    p2_val   = float(overrides.get('p2', 0.025))
+    mpc = BergmanMPC(basal_rate=std_basal, isf=isf,
+                     basal_bg=basal_bg0, body_weight=body_kg,
+                     max_bolus_multiplier=mb_mult, R=R_val,
+                     beta=beta_val, horizon=horizon)
+    mpc.p2 = p2_val  #override hardcoded X decay rate
+    mpc.basal_bg  = basal_bg0
+    offset        = float(overrides.get('correction_target_offset', -10.0))
+    mpc.bg_target = max(110.0, mpc.basal_bg + offset)
 
     pump = Pump(args, patient_name=patient)
+    data = run_episode(mpc, env, args, pump, true_cr=true_cr, prebolus_steps=prebolus)
+    cgm  = np.array(data['cgm_trace'])
 
-    #standard eval
-    print('\nRunning 24h evaluation...')
-    data = run_episode(mpc, env, args, pump)
-    cgm  = data['cgm_trace']
-    pct_tir  = np.mean([(70 <= g <= 180) for g in cgm]) * 100
-    pct_hypo = np.mean([g < 70  for g in cgm]) * 100
-    pct_hyper= np.mean([g > 180 for g in cgm]) * 100
-    print(f'Eval  | r={sum(data["rewards"]):.2f} | '
-          f'cgm mean={np.mean(cgm):.1f}  min={np.min(cgm):.1f}  max={np.max(cgm):.1f}')
-    print(f'       TIR(70-180)={pct_tir:.1f}%  hypo={pct_hypo:.1f}%  hyper={pct_hyper:.1f}%')
+    metrics = {
+        'patient_id':   patient_id,
+        'patient_name': patient,
+        'tir':   float(np.mean((70 <= cgm) & (cgm <= 180)) * 100),
+        'hypo':  float(np.mean(cgm < 70) * 100),
+        'hyper': float(np.mean(cgm > 180) * 100),
+        'cgm_mean': float(np.mean(cgm)),
+        'cgm_min':  float(np.min(cgm)),
+        'cgm_max':  float(np.max(cgm)),
+        'reward_sum': float(sum(data['rewards'])),
+        'clinical': {'isf': isf, 'icr': icr, 'tdd': tdd,
+                     'p3': mpc.p3, 'bg_target': mpc.bg_target,
+                     'body_kg': body_kg},
+        'cgm_trace': data['cgm_trace'],
+        'ins_trace': data['ins_trace'],
+        'infos':     data['infos'],
+        'bg_target': mpc.bg_target,
+    }
+    if verbose:
+        print(f'p{patient_id} {patient}: TIR={metrics["tir"]:.1f}%  '
+              f'hypo={metrics["hypo"]:.1f}%  hyper={metrics["hyper"]:.1f}%  '
+              f'(ISF={isf:.1f}  BW={body_kg:.0f}kg  p3={mpc.p3:.2e}  bgt={mpc.bg_target:.0f})')
+    return metrics
 
-    #easy eval (deterministic meals)
-    import copy
-    easy_args = copy.deepcopy(args)
-    easy_args.meal_prob     = [1, -1, 1, -1, 1, -1]
-    easy_args.meal_amount   = [40, 20, 80, 10, 60, 30]
-    easy_args.meal_variance = [1e-8] * 6
-    easy_args.time_variance = [1e-8] * 6
-    easy_env_id = env_id.replace('-v0', 'mpc_easy-v0')
-    easy_env = get_env(easy_args, patient_name=patient, env_id=easy_env_id,
-                       custom_reward=custom_reward, seed=args.seed + 10000)
-    easy_pump = Pump(easy_args, patient_name=patient)
-    easy_mpc  = MPCController(basal_rate=std_basal, alpha=alpha,
-                              max_bolus_multiplier=max_bolus_mult)
-    easy_mpc.basal_bg  = float(easy_env.reset().CGM)
-    easy_mpc.bg_target = max(110.0, easy_mpc.basal_bg - 10.0)
 
-    print('\nRunning EASY-scenario evaluation (deterministic meals)...')
-    easy_data = run_episode(easy_mpc, easy_env, easy_args, easy_pump)
-    easy_cgm  = easy_data['cgm_trace']
-    pct_tir_e  = np.mean([(70 <= g <= 180) for g in easy_cgm]) * 100
-    pct_hypo_e = np.mean([g < 70  for g in easy_cgm]) * 100
-    pct_hyper_e= np.mean([g > 180 for g in easy_cgm]) * 100
-    print(f'Easy  | r={sum(easy_data["rewards"]):.2f} | '
-          f'cgm mean={np.mean(easy_cgm):.1f}  min={np.min(easy_cgm):.1f}  max={np.max(easy_cgm):.1f}')
-    print(f'       TIR(70-180)={pct_tir_e:.1f}%  hypo={pct_hypo_e:.1f}%  hyper={pct_hyper_e:.1f}%')
+def main():
+    args = Options().parse()
+
+    #train fresh every call (no caching). adjust n_samples in meta_rl.py.
+    from meta_rl import tune_patient
+    overrides = tune_patient(args.patient_id, seed=args.seed)
+
+    metrics = evaluate_patient(args.patient_id, overrides=overrides,
+                               seed=args.seed, verbose=True)
+    cgm = metrics['cgm_trace']
+    print(f'Eval  | r={metrics["reward_sum"]:.2f} | '
+          f'cgm mean={metrics["cgm_mean"]:.1f}  min={metrics["cgm_min"]:.1f}  max={metrics["cgm_max"]:.1f}')
 
     from datetime import datetime
-    import sys
     cmd = 'python ' + ' '.join(sys.argv)
-    ts  = datetime.now().strftime('%Y%m%d_%H%M%S')
-    os.makedirs('bash_results/result_all', exist_ok=True)
+    ts  = os.environ.get('RUN_TS') or datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs(f'bash_results/result_all/results_at_{ts}', exist_ok=True)
 
-    fig = plot_results({'cgm': cgm, 'insulin': data['ins_trace'], 'infos': data['infos']},
+    fig = plot_results({'cgm': cgm, 'insulin': metrics['ins_trace'],
+                        'infos': metrics['infos'], 'bg_target': metrics['bg_target']},
                        args.patient_id, cmd=cmd + '  [MPC]')
-    fname = f'bash_results/result_all/mpc_results_{ts}_p{args.patient_id}.png'
+    fname = f'bash_results/result_all/results_at_{ts}/mpc_results_{ts}_p{args.patient_id}.png'
     fig.savefig(fname, dpi=150, bbox_inches='tight')
     print(f'\nPlot saved to {fname}')
-
-    fig_easy = plot_results({'cgm': easy_cgm, 'insulin': easy_data['ins_trace'],
-                             'infos': easy_data['infos']},
-                            args.patient_id, cmd=cmd + '  [MPC EASY]')
-    fname_easy = f'bash_results/result_all/mpc_results_{ts}_p{args.patient_id}_easy.png'
-    fig_easy.savefig(fname_easy, dpi=150, bbox_inches='tight')
-    print(f'Easy plot saved to {fname_easy}')
 
 
 if __name__ == '__main__':
