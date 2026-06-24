@@ -251,6 +251,10 @@ def main():
     print(f'Time in range (70-180): {metrics["tir"]:.1f}%  '
           f'Hypo (<70): {metrics["hypo"]:.1f}%  Hyper (>180): {metrics["hyper"]:.1f}%')
 
+    #get total insulin delivered after evaluation
+    total_insulin = sum(metrics['ins_trace']) * 5.0 #U/min for 5-min steps so multiply by 5 and add all to get 1 full day
+    print(f'Total insulin delivered in 1 day: {total_insulin:.2f} U/day')
+
     #plot + save like main.py
     tag = 'mpc' if not drl else 'hybrid'
     cmd = 'python ' + ' '.join(sys.argv)
