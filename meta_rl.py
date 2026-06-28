@@ -55,28 +55,51 @@ def _perturb(base, rng, sigma=0.3):
     return out
 
 
-def tune_patient(patient_id, seed=0, n_samples=40):
+def _plot_tune_reward(cand_rs, best_rs, baseline_r, patient_id):
+    """Save the hill-climb reward over tuning samples (candidate + best-so-far)."""
+    import os
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    if not cand_rs:
+        return
+    x = np.arange(1, len(cand_rs) + 1)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.axhline(baseline_r, color='0.6', ls='--', lw=1, label=f'baseline {baseline_r:.1f}')
+    ax.plot(x, cand_rs, 'o', ms=3, color='0.6', label='candidate reward')
+    ax.plot(x, best_rs, color='C2', lw=2, label='best-so-far')
+    ax.set_xlabel('hill-climb sample'); ax.set_ylabel('reward (severity-aware TIR)')
+    ax.set_title(f'Hybrid MPC tuning reward — patient {patient_id}')
+    ax.legend(); ax.grid(alpha=0.3)
+    out = f'bash_results/result_all/tune_reward_p{patient_id}.png'
+    os.makedirs('bash_results/result_all', exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f'tuning reward curve saved -> {out}')
+
+
+def tune_patient(patient_id, seed=0, n_samples=40, model='bergman'):
     # hill climb over the clinical+controller knobs, starting from cohort-aware defaults each call (no cache)
     from main import evaluate_patient
 
     rng = np.random.default_rng(seed + patient_id)
 
     best = default_overrides(patient_id)
-    m = evaluate_patient(patient_id, overrides=best, seed=seed, verbose=False)
-    best_r = _reward(m)
+    m = evaluate_patient(patient_id, overrides=best, seed=seed, verbose=False, model=model)
+    best_r = _reward(m); baseline_r = best_r
     print(f'  baseline: TIR={m["tir"]:5.1f}%  hypo={m["hypo"]:4.1f}%  '
           f'hyper={m["hyper"]:4.1f}%  reward={best_r:6.2f}')
 
+    cand_rs, best_rs = [], []
     for i in range(n_samples):
         sigma = 0.4 - 0.3 * (i / max(1, n_samples - 1))
         cand  = _perturb(best, rng, sigma=sigma)
-        m     = evaluate_patient(patient_id, overrides=cand, seed=seed, verbose=False)
+        m     = evaluate_patient(patient_id, overrides=cand, seed=seed, verbose=False, model=model)
         r     = _reward(m)
         flag  = ''
         if r > best_r:
             best_r = r
             best   = cand
             flag   = '  <- new best'
+        cand_rs.append(r); best_rs.append(best_r)
         print(f'  s{i+1:2d}/{n_samples} sig={sigma:.2f}: TIR={m["tir"]:5.1f}%  '
               f'hypo={m["hypo"]:4.1f}%  hyper={m["hyper"]:4.1f}%  reward={r:6.2f}  '
               f'(isf*={cand["isf_mult"]:.2f} off={cand["correction_target_offset"]:+.1f} '
@@ -84,4 +107,5 @@ def tune_patient(patient_id, seed=0, n_samples=40):
               f'b={cand["beta"]:.2f} p2={cand["p2"]:.3f}){flag}')
 
     print(f'\nbest reward {best_r:.2f}  params {best}')
+    _plot_tune_reward(cand_rs, best_rs, baseline_r, patient_id)
     return best

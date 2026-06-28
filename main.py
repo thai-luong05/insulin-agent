@@ -5,12 +5,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 from decouple import config
 from bergman_controller import BergmanMPC
+from lti_controller import LTIMPC
 
+#controller registry: pick the prediction model with the --model flag / model= kwarg
+MPC_MODELS = {'bergman': BergmanMPC, 'lti': LTIMPC}
+
+
+#resolve simglucose's bundled params from the installed package (portable across venv name / OS)
+import simglucose
+_SIMGLUCOSE_PARAMS = os.path.join(os.path.dirname(simglucose.__file__), 'params')
 
 #simglucose ships per-patient clinical params (CF=ISF, CR=ICR, TDI=TDD)
-_QUEST_CSV = os.path.join(os.path.dirname(__file__),
-                          'venv', 'Lib', 'site-packages',
-                          'simglucose', 'params', 'Quest.csv')
+_QUEST_CSV = os.path.join(_SIMGLUCOSE_PARAMS, 'Quest.csv')
 _quest_df = None
 
 def get_clinical_params(patient_name):
@@ -23,9 +29,7 @@ def get_clinical_params(patient_name):
             'tdd': float(row['TDI']), 'age': int(row['Age'])}
 
 
-_VPATIENT_CSV = os.path.join(os.path.dirname(__file__),
-                             'venv', 'Lib', 'site-packages',
-                             'simglucose', 'params', 'vpatient_params.csv')
+_VPATIENT_CSV = os.path.join(_SIMGLUCOSE_PARAMS, 'vpatient_params.csv')
 _vpatient_df = None
 
 def get_body_weight(patient_name):
@@ -214,8 +218,8 @@ def default_max_bolus_mult(patient_id):
     return 15.0
 
 
-def evaluate_patient(patient_id, overrides=None, seed=0, verbose=True):
-    # One 24h hybrid rollout (open-loop carb-ratio meal bolus + Bergman correction MPC) with optional RL overrides; returns TIR/hypo/hyper metrics + traces. Override keys: isf_mult, correction_target_offset, max_bolus_mult, R_log10, beta, p2, horizon, prebolus_steps, cr_mult.
+def evaluate_patient(patient_id, overrides=None, seed=0, verbose=True, model='bergman'):
+    # One 24h hybrid rollout (open-loop carb-ratio meal bolus + correction MPC) with optional RL overrides; returns TIR/hypo/hyper metrics + traces. Override keys: isf_mult, correction_target_offset, max_bolus_mult, R_log10, beta, p2, horizon, prebolus_steps, cr_mult. model in {'bergman','lti'} picks the prediction model.
     overrides = overrides or {}
 
     saved_argv = sys.argv
@@ -261,10 +265,11 @@ def evaluate_patient(patient_id, overrides=None, seed=0, verbose=True):
 
     beta_val = float(overrides.get('beta', 3.0))
     p2_val   = float(overrides.get('p2', 0.025))
-    mpc = BergmanMPC(basal_rate=std_basal, isf=isf,
-                     basal_bg=basal_bg0, body_weight=body_kg,
-                     max_bolus_multiplier=mb_mult, R=R_val,
-                     beta=beta_val, horizon=horizon)
+    MPC = MPC_MODELS[model]
+    mpc = MPC(basal_rate=std_basal, isf=isf,
+              basal_bg=basal_bg0, body_weight=body_kg,
+              max_bolus_multiplier=mb_mult, R=R_val,
+              beta=beta_val, horizon=horizon)
     mpc.p2 = p2_val  #override hardcoded X decay rate
     mpc.basal_bg  = basal_bg0
     offset        = float(overrides.get('correction_target_offset', -10.0))
