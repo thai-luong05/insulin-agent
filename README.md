@@ -1,14 +1,14 @@
 # Closed-loop insulin regulation
 
 Model-predictive and hybrid controllers for the FDA-accepted UVA/Padova simulator
-(via `simglucose` / G2P2C). Three controllers are included:
+(via `simglucose` / G2P2C). Three controllers are included:<br>
 
-Controller, Name, Script for running:
-| Bergman MPC | Bergman 1981 nonlinear minimal model | `hybrid_policy.py --model bergman` |
-| LTI MPC | Linearized Bergman, exact-discretized, UCSB zone cost | `hybrid_policy.py --model lti` |
-| HyCPAP | ZoneMPC + ensemble DRL (Gaussian-product blend, Wu et al. 2024) | `hycpap_full.py` |
+Controller, Name, Script for running:<br>
+| Bergman MPC | Bergman 1981 nonlinear minimal model | `hybrid_policy.py --model bergman` |<br>
+| LTI MPC | Linearized Bergman, exact-discretized, UCSB zone cost | `hybrid_policy.py --model lti` |<br>
+| HyCPAP | ZoneMPC + ensemble DRL (Gaussian-product blend, Wu et al. 2024) | `hycpap_full.py` |<br>
 
-NOTE ON EACH GROUP OF PATIENT ID PROVIDED FROM THE SIMULATOR:
+NOTE ON EACH GROUP OF PATIENT ID PROVIDED FROM THE SIMULATOR:<br>
 Patient ids: 0–9 adolescents, 10–19 children, 20–29 adults.
 Each evaluation graph is one 24 h day (288 steps x 5 min interval).
 
