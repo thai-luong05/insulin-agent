@@ -142,3 +142,18 @@ class LTIMPC:
                 best_cost = cost
                 best_u    = u
         return float(best_u)
+
+    # ── HyCPAP-prior interface (lets this controller act as the Gaussian prior in the blend) ──
+    def compute(self, G_now, X_now, I_now, v_now=0.0):
+        # correction dose + a spread; sigma wider near/below the zone, tighter into hyper
+        u = self.compute_insulin(G_now, X_now, I_now, self.bg_target)
+        sigma = 0.10 * self.u_max * (1.0 + max(self.zone_lo - G_now, 0.0) / 40.0)
+        return float(u), float(max(sigma, 1e-3))
+
+    def hypo_cap(self, u_desired, G_now, X_now, I_now, floor=70.0):
+        # largest dose <= u_desired whose predicted trajectory stays >= floor
+        safe = 0.0
+        for u in np.linspace(0.0, max(u_desired, 0.0), 13):
+            if min(self._rollout([u] * self.horizon, G_now, X_now, I_now, 0.0)) >= floor:
+                safe = u
+        return float(min(safe, self.u_max))

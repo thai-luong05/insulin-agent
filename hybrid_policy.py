@@ -4,6 +4,8 @@ import sys
 import random
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -204,6 +206,185 @@ def _load_ensemble(paths):
     return members
 
 
+# ============ RL SUPERVISOR (LTI + RL): the policy sets the MPC's aggressiveness knob ============
+# The RL never touches insulin. It outputs a bounded ISF multiplier (controller sensitivity); the
+# MPC solves for the dose WITH ITS OWN HYPO CONSTRAINT, so the supervisor cannot command an unsafe
+# dose. Per Qunwei: p1 (glucose effectiveness) and p2 (insulin-action decay) stay FIXED — physio
+# kinetics, not knobs. Only the sensitivity gain (ISF -> p3) is modulated. Offline grad-clipped TD3+BC.
+KNOB_LO, KNOB_HI = 0.5, 1.5      # ISF multiplier: <1 => insulin treated as weaker => MPC doses MORE (LGS handles hypo safety)
+
+
+def _sup_kovatchev(bg):
+    bg = max(bg, 1.0)
+    f = 1.509 * (np.log(bg) ** 1.084 - 5.381)
+    return -10.0 * f * f
+
+
+class SupActor(nn.Module):
+    def __init__(self, sdim=10, hid=128):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(sdim, hid), nn.ReLU(),
+                                 nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, 1))
+        self.c = 0.5 * (KNOB_HI + KNOB_LO); self.h = 0.5 * (KNOB_HI - KNOB_LO)
+
+    def forward(self, s):
+        return self.c + self.h * torch.tanh(self.net(s))
+
+
+class SupCritic(nn.Module):
+    def __init__(self, sdim=10, hid=128):
+        super().__init__()
+        def q():
+            return nn.Sequential(nn.Linear(sdim + 1, hid), nn.ReLU(),
+                                 nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, 1))
+        self.q1, self.q2 = q(), q()
+
+    def forward(self, s, a):
+        x = torch.cat([s, a], -1); return self.q1(x), self.q2(x)
+
+    def Q1(self, s, a):
+        return self.q1(torch.cat([s, a], -1))
+
+
+def _sup_setup(patient_id, overrides, seed, model):
+    from main import (get_clinical_params, get_body_weight, get_patient_env, get_env,
+                      custom_reward, Options, Pump, get_basal, MPC_MODELS,
+                      default_max_bolus_mult, calibrate)
+    from utils.statespace import StateSpace
+    import gym.envs.registration as _reg
+    saved = sys.argv; sys.argv = [saved[0]]
+    try:    args = Options().parse()
+    finally: sys.argv = saved
+    args.patient_id = patient_id; args.seed = seed
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    patients, env_ids = get_patient_env(); patient = patients[patient_id]
+    if 10 <= patient_id < 20:
+        bw_kg = get_body_weight(patient); prop = [30, 15, 45, 15, 45, 15]
+        scale = 3.5 * bw_kg / sum(prop)
+        args.meal_amount   = [max(5, round(p * scale)) for p in prop]
+        args.meal_variance = [max(1, round(a / 6))   for a in args.meal_amount]
+    _reg.registry.env_specs.pop(env_ids[patient_id], None)
+    env = get_env(args, patient_name=patient, env_id=env_ids[patient_id],
+                  custom_reward=custom_reward, seed=seed)
+    basal = get_basal(patient); clin = get_clinical_params(patient); bw = get_body_weight(patient)
+    isf = (1700.0 / clin['tdd']) * overrides['isf_mult']; true_cr = clin['icr'] * overrides['cr_mult']
+    horizon = int(overrides['horizon']); prebolus = int(overrides['prebolus_steps'])
+    mb_mult = float(overrides.get('max_bolus_mult', default_max_bolus_mult(patient_id)))
+    R_val = 10.0 ** overrides['R_log10']
+    ss = StateSpace(args); pump = Pump(args, patient_name=patient)
+    _, cgm0 = calibrate(env, ss, args, pump)
+    mpc = MPC_MODELS[model](basal_rate=basal, isf=isf, basal_bg=cgm0, body_weight=bw,
+                            max_bolus_multiplier=mb_mult, R=R_val, beta=overrides['beta'], horizon=horizon)
+    mpc.p2 = overrides['p2']; mpc.basal_bg = cgm0                     # p2 FIXED here, never modulated
+    mpc.bg_target = max(110.0, cgm0 + overrides['correction_target_offset'])
+    try:
+        sched = env.env.scenario.scenario.get('meal', {'time': [], 'amount': []})
+        meal_steps = [t / 5.0 - args.calibration for t in sched['time']]
+        meal_amounts = [float(a) for a in sched['amount']]
+    except Exception:
+        meal_steps, meal_amounts = [], []
+    return env, mpc, basal, bw, clin, true_cr, prebolus, meal_steps, meal_amounts, cgm0
+
+
+def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rng=None, model='lti'):
+    # knob_net set -> deploy (returns metrics); knob_net None -> collect random-knob data (returns rows)
+    from freestyle_rl.state_builder import build_state, iob_decay
+    from meta_rl import default_overrides
+    overrides = overrides or default_overrides(patient_id)
+    env, mpc, basal, bw, clin, true_cr, prebolus, meal_steps, meal_amounts, cgm0 = \
+        _sup_setup(patient_id, overrides, seed, model)
+    base_isf = mpc.isf
+    X = I = 0.0; bolus_q = 0.0; bolused = set(); iob = 0.0
+    cgm_now = cgm0; prev_cgm = cgm0
+    rows, prev = [], None
+    cgm_tr, ins_tr, infos = [], [], []
+    for step in range(288):
+        for idx, (ms, ma) in enumerate(zip(meal_steps, meal_amounts)):
+            if idx not in bolused and step <= ms <= step + prebolus:
+                bolus_q += ma / float(true_cr); bolused.add(idx)
+        s = build_state(basal, bw, clin['isf'], clin['icr'], clin['tdd'],
+                        cgm_now=cgm_now, cgm_prev=prev_cgm, iob_proxy=iob,
+                        meal_carbs_announced=0.0, mins_to_next_meal=240.0)
+        if knob_net is not None:
+            with torch.no_grad():
+                knob = float(knob_net(torch.from_numpy(s).unsqueeze(0)).item())
+        else:
+            knob = float(rng.uniform(KNOB_LO, KNOB_HI))
+        # RL modulates ONLY the sensitivity gain (ISF -> p3); p1, p2, n stay fixed (per Qunwei)
+        mpc.isf = base_isf * knob
+        mpc.p3  = mpc.isf * mpc.p2 * mpc.n * mpc.V_I / (1000.0 * mpc.Gb)
+        mpc_corr = mpc.compute_insulin(G_now=cgm_now, X_now=X, I_now=I, G_target=mpc.bg_target)
+        from_queue = min(bolus_q / 5.0, mpc.u_max) if bolus_q > 0 else 0.0
+        bolus_q = max(0.0, bolus_q - from_queue * 5.0)
+        delivered = float(min(mpc.u_max, mpc_corr + from_queue))
+        env_s, _, _, info = env.step(delivered)
+        prev_cgm = cgm_now; cgm_now = env_s.CGM
+        iob = iob_decay(iob, delivered * 5.0)
+        I += mpc.dt * (-mpc.n * I + 1000.0 * (delivered - mpc.u_basal) / mpc.V_I)
+        X += mpc.dt * (-mpc.p2 * X + mpc.p3 * I)
+        cgm_tr.append(cgm_now); ins_tr.append(delivered); infos.append(info)
+        if knob_net is None:
+            r = _sup_kovatchev(cgm_now)
+            if prev is not None:
+                rows.append((prev[0], prev[1], prev[2], s, 0.0))
+            if cgm_now < 40.0 or cgm_now > 450.0:                    # medical-emergency terminal
+                rows.append((s, np.float32(knob), np.float32(r - 100.0), s, 1.0)); prev = None; break
+            prev = (s, np.float32(knob), np.float32(r))
+    if knob_net is None:
+        if prev is not None:
+            rows.append((prev[0], prev[1], prev[2], s, 1.0))
+        return rows
+    c = np.array(cgm_tr)
+    return {'tir': float(np.mean((70 <= c) & (c <= 180)) * 100), 'hypo': float(np.mean(c < 70) * 100),
+            'sev_hypo': float(np.mean(c < 54) * 100), 'hyper': float(np.mean(c > 180) * 100),
+            'cgm_min': float(c.min()), 'cgm_max': float(c.max()),
+            'cgm_trace': cgm_tr, 'ins_trace': ins_tr, 'infos': infos, 'bg_target': mpc.bg_target}
+
+
+def train_supervisor(patient_id, out, overrides, seeds=40, steps=40000, model='lti'):
+    import copy
+    rng = np.random.default_rng(patient_id)
+    S, A, R, S2, D = [], [], [], [], []
+    for si in range(seeds):
+        for s, a, r, s2, d in run_supervisor_episode(patient_id, knob_net=None, seed=si,
+                                                      overrides=overrides, rng=rng, model=model):
+            S.append(s); A.append(a); R.append(r); S2.append(s2); D.append(d)
+    S = torch.tensor(np.asarray(S, np.float32)); A = torch.tensor(np.asarray(A, np.float32)).unsqueeze(1)
+    R = torch.tensor(np.asarray(R, np.float32)).unsqueeze(1)
+    S2 = torch.tensor(np.asarray(S2, np.float32)); D = torch.tensor(np.asarray(D, np.float32)).unsqueeze(1)
+    mean = S.mean(0, keepdim=True); std = S.std(0, keepdim=True) + 1e-3
+    Sn, S2n = (S - mean) / std, (S2 - mean) / std
+    N, sdim = S.shape[0], S.shape[1]
+    print(f'[supervisor p{patient_id}] {N} transitions, knob range [{float(A.min()):.2f},{float(A.max()):.2f}]', flush=True)
+    actor = SupActor(sdim); actor_t = copy.deepcopy(actor)
+    critic = SupCritic(sdim); critic_t = copy.deepcopy(critic)
+    oa = torch.optim.Adam(actor.parameters(), lr=3e-4); oc = torch.optim.Adam(critic.parameters(), lr=3e-4)
+    for t in range(steps):
+        idx = torch.randint(0, N, (256,))
+        s, a, r, s2, dn = Sn[idx], A[idx], R[idx], S2n[idx], D[idx]
+        with torch.no_grad():
+            noise = (torch.randn_like(a) * 0.1).clamp(-0.25, 0.25)
+            a2 = (actor_t(s2) + noise).clamp(KNOB_LO, KNOB_HI)
+            q1t, q2t = critic_t(s2, a2)
+            y = r + 0.99 * (1.0 - dn) * torch.min(q1t, q2t)
+        q1, q2 = critic(s, a)
+        closs = F.mse_loss(q1, y) + F.mse_loss(q2, y)
+        oc.zero_grad(); closs.backward(); nn.utils.clip_grad_norm_(critic.parameters(), 1.0); oc.step()
+        if t % 2 == 0:
+            pi = actor(s); q = critic.Q1(s, pi)
+            lmbda = 2.5 / (q.abs().mean().detach() + 1e-6)
+            aloss = -lmbda * q.mean() + F.mse_loss(pi, a)
+            oa.zero_grad(); aloss.backward(); nn.utils.clip_grad_norm_(actor.parameters(), 1.0); oa.step()
+            for p, pt in zip(critic.parameters(), critic_t.parameters()):
+                pt.data.mul_(0.995); pt.data.add_(0.005 * p.data)
+            for p, pt in zip(actor.parameters(), actor_t.parameters()):
+                pt.data.mul_(0.995); pt.data.add_(0.005 * p.data)
+        if (t + 1) % 10000 == 0:
+            print(f'  step {t+1}: critic={closs.item():.2f}', flush=True)
+    torch.save({'actor': actor.state_dict(), 'mean': mean, 'std': std, 'sdim': sdim}, out)
+    print(f'[supervisor] saved -> {out}', flush=True)
+
+
 def main():
     import argparse
     from datetime import datetime
@@ -222,10 +403,41 @@ def main():
                     help='skip per-patient MPC tuning (use defaults)')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--selftest', action='store_true', help='just run the blend-math self-test')
+    ap.add_argument('--supervisor', action='store_true',
+                    help='LTI+RL: RL sets the MPC aggressiveness knob (ISF mult); the MPC doses safely')
+    ap.add_argument('--sup_seeds', type=int, default=40)
+    ap.add_argument('--sup_steps', type=int, default=40000)
     a = ap.parse_args()
 
     if a.selftest:
         _selftest(); return
+
+    if a.supervisor:
+        from meta_rl import default_overrides
+        ov = default_overrides(a.patient_id)
+        polf = f'freestyle_rl/supervisor_p{a.patient_id}.pt'
+        print(f'Training RL supervisor (LTI+RL knob, model={a.model}) for p{a.patient_id}...')
+        train_supervisor(a.patient_id, polf, ov, seeds=a.sup_seeds, steps=a.sup_steps, model=a.model)
+        ck = torch.load(polf, map_location='cpu')
+        act = SupActor(ck['sdim']); act.load_state_dict(ck['actor']); act.eval()
+        mean, std = ck['mean'], ck['std']
+        knob_net = lambda st: act((st - mean) / std)
+        const1  = lambda st: torch.ones((st.shape[0], 1))
+        print('Running MPC-only baseline (knob=1)...')
+        base = run_supervisor_episode(a.patient_id, knob_net=const1, seed=a.seed, overrides=ov, model=a.model)
+        print('Running MPC + RL-supervisor...')
+        m = run_supervisor_episode(a.patient_id, knob_net=knob_net, seed=a.seed, overrides=ov, model=a.model)
+        print(f'\np{a.patient_id}: MPC-only TIR={base["tir"]:.1f} -> +RL-knob TIR={m["tir"]:.1f}  '
+              f'sevHypo={m["sev_hypo"]:.1f}  hypo={m["hypo"]:.1f}  hyper={m["hyper"]:.1f}  min={m["cgm_min"]:.0f}')
+        ts = os.environ.get('RUN_TS') or datetime.now().strftime('%Y%m%d_%H%M%S')
+        outdir = f'bash_results/result_all/results_at_{ts}'; os.makedirs(outdir, exist_ok=True)
+        fig = plot_results({'cgm': m['cgm_trace'], 'insulin': m['ins_trace'],
+                            'infos': m['infos'], 'bg_target': m['bg_target']}, a.patient_id,
+                           cmd=f'python hybrid_policy.py --supervisor --patient_id {a.patient_id} --model {a.model}  [LTI+RL knob]')
+        fname = f'{outdir}/supervisor_{a.model}_{ts}_p{a.patient_id}.png'
+        fig.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f'Plot saved to {fname}')
+        return
 
     #tune the MPC knobs for this patient (or use defaults)
     if a.no_tune:

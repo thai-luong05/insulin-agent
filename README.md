@@ -44,6 +44,13 @@ python hybrid_policy.py --patient_id 20 --model lti --no-drl   # pure MPC
 python hybrid_policy.py --patient_id 20 --model lti            # MPC + DRL blend
 ```
 
+`--supervisor` trains a per-patient RL policy (offline TD3+BC) that sets the MPC's ISF
+aggressiveness knob each step; the MPC still computes the dose, so it stays hypo-safe.
+
+```bash
+python hybrid_policy.py --supervisor --patient_id 20 --model lti   # LTI + RL knob
+```
+
 ## Bergman MPC
 
 ```bash
