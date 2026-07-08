@@ -1,4 +1,5 @@
 # HyCPAP-style hybrid: blend MPC and DRL doses via Gaussian product (Wu et al. 2024). No DRL = pure MPC.
+#NOTE: THIS FILE IS NOT BEING USED ANYMORE, THE UPDATED FILE IS OUTSIDE OF THIS FOLDER
 import os
 import sys
 import random
