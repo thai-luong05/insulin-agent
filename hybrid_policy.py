@@ -206,12 +206,32 @@ def _load_ensemble(paths):
     return members
 
 
-# ============ RL SUPERVISOR (LTI + RL): the policy sets the MPC's aggressiveness knob ============
-# The RL never touches insulin. It outputs a bounded ISF multiplier (controller sensitivity); the
-# MPC solves for the dose WITH ITS OWN HYPO CONSTRAINT, so the supervisor cannot command an unsafe
-# dose. Per Qunwei: p1 (glucose effectiveness) and p2 (insulin-action decay) stay FIXED — physio
-# kinetics, not knobs. Only the sensitivity gain (ISF -> p3) is modulated. Offline grad-clipped TD3+BC.
-KNOB_LO, KNOB_HI = 0.5, 1.5      # ISF multiplier: <1 => insulin treated as weaker => MPC doses MORE (LGS handles hypo safety)
+# ============ rl supervisor (lti + rl): the policy tunes the mpc knobs, not the dose ============
+# rl never touches insulin. it outputs bounded mpc knobs (see SUP_KNOBS); the mpc solves the dose
+# with its own hypo constraint, so the supervisor cannot command an unsafe dose. p1/p2 stay fixed
+# (physio kinetics, not knobs). offline grad-clipped td3+bc.
+KNOB_LO, KNOB_HI = -1.0, 1.0     # normalized action space; knob_to_phys maps to real mpc knobs
+# rl tunes 5 mpc knobs (one mult/offset each); p1,p2 fixed; neutral [1,1,1,1,0] = pure mpc
+SUP_KNOBS = [
+    ('isf_mult',       0.5,  1.5),   # sensitivity gain (isf -> p3); <1 => doses more
+    ('horizon_mult',   0.5,  2.0),   # prediction horizon
+    ('R_mult',         0.3,  3.0),   # input penalty; high => conservative
+    ('R_dn_mult',      0.3,  3.0),   # suspend-below-basal cost (lti only)
+    ('target_offset', -15.0, 15.0),  # bg-target shift (mg/dl)
+]
+SUP_ADIM  = len(SUP_KNOBS)
+_SUP_LO   = np.array([k[1] for k in SUP_KNOBS], dtype=np.float32)
+_SUP_HI   = np.array([k[2] for k in SUP_KNOBS], dtype=np.float32)
+_SUP_NEUT = np.array([1.0, 1.0, 1.0, 1.0, 0.0], dtype=np.float32)   # physical neutral = pure mpc
+
+
+def knob_to_phys(a):
+    # normalized action [-1,1] -> physical knob values
+    a = np.clip(np.asarray(a, dtype=np.float32), -1.0, 1.0)
+    return _SUP_LO + 0.5 * (a + 1.0) * (_SUP_HI - _SUP_LO)
+
+
+_SUP_NEUT_A = (2.0 * (_SUP_NEUT - _SUP_LO) / (_SUP_HI - _SUP_LO) - 1.0).astype(np.float32)   # action that gives pure mpc
 
 
 def _sup_kovatchev(bg):
@@ -224,18 +244,17 @@ class SupActor(nn.Module):
     def __init__(self, sdim=10, hid=128):
         super().__init__()
         self.net = nn.Sequential(nn.Linear(sdim, hid), nn.ReLU(),
-                                 nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, 1))
-        self.c = 0.5 * (KNOB_HI + KNOB_LO); self.h = 0.5 * (KNOB_HI - KNOB_LO)
+                                 nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, SUP_ADIM))
 
     def forward(self, s):
-        return self.c + self.h * torch.tanh(self.net(s))
+        return torch.tanh(self.net(s))          # normalized knob vector in [-1,1]^ADIM
 
 
 class SupCritic(nn.Module):
     def __init__(self, sdim=10, hid=128):
         super().__init__()
         def q():
-            return nn.Sequential(nn.Linear(sdim + 1, hid), nn.ReLU(),
+            return nn.Sequential(nn.Linear(sdim + SUP_ADIM, hid), nn.ReLU(),
                                  nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, 1))
         self.q1, self.q2 = q(), q()
 
@@ -293,7 +312,11 @@ def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rn
     overrides = overrides or default_overrides(patient_id)
     env, mpc, basal, bw, clin, true_cr, prebolus, meal_steps, meal_amounts, cgm0 = \
         _sup_setup(patient_id, overrides, seed, model)
-    base_isf = mpc.isf
+    base_isf     = mpc.isf                          # tuned base; knobs scale these
+    base_horizon = mpc.horizon
+    base_R       = mpc.R
+    base_R_dn    = getattr(mpc, 'R_dn_frac', 0.1)
+    base_target  = mpc.bg_target
     X = I = 0.0; bolus_q = 0.0; bolused = set(); iob = 0.0
     cgm_now = cgm0; prev_cgm = cgm0
     rows, prev = [], None
@@ -307,12 +330,18 @@ def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rn
                         meal_carbs_announced=0.0, mins_to_next_meal=240.0)
         if knob_net is not None:
             with torch.no_grad():
-                knob = float(knob_net(torch.from_numpy(s).unsqueeze(0)).item())
+                a = knob_net(torch.from_numpy(s).unsqueeze(0)).squeeze(0).numpy()
         else:
-            knob = float(rng.uniform(KNOB_LO, KNOB_HI))
-        # RL modulates ONLY the sensitivity gain (ISF -> p3); p1, p2, n stay fixed (per Qunwei)
-        mpc.isf = base_isf * knob
-        mpc.p3  = mpc.isf * mpc.p2 * mpc.n * mpc.V_I / (1000.0 * mpc.Gb)
+            a = rng.uniform(-1.0, 1.0, SUP_ADIM).astype(np.float32)
+        phys = knob_to_phys(a)                      # [isf_mult, horizon_mult, r_mult, r_dn_mult, target_offset]
+        # rl tunes isf/horizon/cost/target; p1,p2,n fixed
+        mpc.isf     = base_isf * float(phys[0])
+        mpc.p3      = mpc.isf * mpc.p2 * mpc.n * mpc.V_I / (1000.0 * mpc.Gb)
+        mpc.horizon = max(4, int(round(base_horizon * float(phys[1]))))
+        mpc.R       = base_R * float(phys[2])
+        if hasattr(mpc, 'R_dn_frac'):
+            mpc.R_dn_frac = base_R_dn * float(phys[3])
+        mpc.bg_target = base_target + float(phys[4])
         mpc_corr = mpc.compute_insulin(G_now=cgm_now, X_now=X, I_now=I, G_target=mpc.bg_target)
         from_queue = min(bolus_q / 5.0, mpc.u_max) if bolus_q > 0 else 0.0
         bolus_q = max(0.0, bolus_q - from_queue * 5.0)
@@ -328,8 +357,8 @@ def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rn
             if prev is not None:
                 rows.append((prev[0], prev[1], prev[2], s, 0.0))
             if cgm_now < 40.0 or cgm_now > 450.0:                    # medical-emergency terminal
-                rows.append((s, np.float32(knob), np.float32(r - 100.0), s, 1.0)); prev = None; break
-            prev = (s, np.float32(knob), np.float32(r))
+                rows.append((s, a.astype(np.float32), np.float32(r - 100.0), s, 1.0)); prev = None; break
+            prev = (s, a.astype(np.float32), np.float32(r))
     if knob_net is None:
         if prev is not None:
             rows.append((prev[0], prev[1], prev[2], s, 1.0))
@@ -337,7 +366,7 @@ def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rn
     c = np.array(cgm_tr)
     return {'tir': float(np.mean((70 <= c) & (c <= 180)) * 100), 'hypo': float(np.mean(c < 70) * 100),
             'sev_hypo': float(np.mean(c < 54) * 100), 'hyper': float(np.mean(c > 180) * 100),
-            'cgm_min': float(c.min()), 'cgm_max': float(c.max()),
+            'cgm_min': float(c.min()), 'cgm_max': float(c.max()), 'cgm_mean': float(c.mean()),
             'cgm_trace': cgm_tr, 'ins_trace': ins_tr, 'infos': infos, 'bg_target': mpc.bg_target}
 
 
@@ -349,13 +378,13 @@ def train_supervisor(patient_id, out, overrides, seeds=40, steps=40000, model='l
         for s, a, r, s2, d in run_supervisor_episode(patient_id, knob_net=None, seed=si,
                                                       overrides=overrides, rng=rng, model=model):
             S.append(s); A.append(a); R.append(r); S2.append(s2); D.append(d)
-    S = torch.tensor(np.asarray(S, np.float32)); A = torch.tensor(np.asarray(A, np.float32)).unsqueeze(1)
+    S = torch.tensor(np.asarray(S, np.float32)); A = torch.tensor(np.asarray(A, np.float32))   # (n, adim)
     R = torch.tensor(np.asarray(R, np.float32)).unsqueeze(1)
     S2 = torch.tensor(np.asarray(S2, np.float32)); D = torch.tensor(np.asarray(D, np.float32)).unsqueeze(1)
     mean = S.mean(0, keepdim=True); std = S.std(0, keepdim=True) + 1e-3
     Sn, S2n = (S - mean) / std, (S2 - mean) / std
     N, sdim = S.shape[0], S.shape[1]
-    print(f'[supervisor p{patient_id}] {N} transitions, knob range [{float(A.min()):.2f},{float(A.max()):.2f}]', flush=True)
+    print(f'[supervisor p{patient_id}] {N} transitions, {SUP_ADIM} knobs (normalized [-1,1])', flush=True)
     actor = SupActor(sdim); actor_t = copy.deepcopy(actor)
     critic = SupCritic(sdim); critic_t = copy.deepcopy(critic)
     oa = torch.optim.Adam(actor.parameters(), lr=3e-4); oc = torch.optim.Adam(critic.parameters(), lr=3e-4)
@@ -364,7 +393,7 @@ def train_supervisor(patient_id, out, overrides, seeds=40, steps=40000, model='l
         s, a, r, s2, dn = Sn[idx], A[idx], R[idx], S2n[idx], D[idx]
         with torch.no_grad():
             noise = (torch.randn_like(a) * 0.1).clamp(-0.25, 0.25)
-            a2 = (actor_t(s2) + noise).clamp(KNOB_LO, KNOB_HI)
+            a2 = (actor_t(s2) + noise).clamp(-1.0, 1.0)
             q1t, q2t = critic_t(s2, a2)
             y = r + 0.99 * (1.0 - dn) * torch.min(q1t, q2t)
         q1, q2 = critic(s, a)
@@ -381,8 +410,20 @@ def train_supervisor(patient_id, out, overrides, seeds=40, steps=40000, model='l
                 pt.data.mul_(0.995); pt.data.add_(0.005 * p.data)
         if (t + 1) % 10000 == 0:
             print(f'  step {t+1}: critic={closs.item():.2f}', flush=True)
-    torch.save({'actor': actor.state_dict(), 'mean': mean, 'std': std, 'sdim': sdim}, out)
+    torch.save({'actor': actor.state_dict(), 'mean': mean, 'std': std, 'sdim': sdim, 'adim': SUP_ADIM}, out)
     print(f'[supervisor] saved -> {out}', flush=True)
+
+
+def _append_summary(outdir, line, header=None):
+    # append one patient's line to a shared summary.txt; run.sh exports one run_ts
+    # so all 30 patients land in the same file
+    path = os.path.join(outdir, 'summary.txt')
+    new = not os.path.exists(path)
+    with open(path, 'a', encoding='utf-8') as f:
+        if new and header:
+            f.write(header + '\n')
+        f.write(line + '\n')
+    return path
 
 
 def main():
@@ -422,21 +463,33 @@ def main():
         act = SupActor(ck['sdim']); act.load_state_dict(ck['actor']); act.eval()
         mean, std = ck['mean'], ck['std']
         knob_net = lambda st: act((st - mean) / std)
-        const1  = lambda st: torch.ones((st.shape[0], 1))
-        print('Running MPC-only baseline (knob=1)...')
-        base = run_supervisor_episode(a.patient_id, knob_net=const1, seed=a.seed, overrides=ov, model=a.model)
+        neutral  = lambda st: torch.from_numpy(_SUP_NEUT_A).float().unsqueeze(0).expand(st.shape[0], -1)
+        print('Running MPC-only baseline (neutral knobs)...')
+        base = run_supervisor_episode(a.patient_id, knob_net=neutral, seed=a.seed, overrides=ov, model=a.model)
         print('Running MPC + RL-supervisor...')
         m = run_supervisor_episode(a.patient_id, knob_net=knob_net, seed=a.seed, overrides=ov, model=a.model)
-        print(f'\np{a.patient_id}: MPC-only TIR={base["tir"]:.1f} -> +RL-knob TIR={m["tir"]:.1f}  '
+        print(f'\np{a.patient_id}: MPC-only TIR={base["tir"]:.1f} -> +RL-knobs TIR={m["tir"]:.1f}  '
               f'sevHypo={m["sev_hypo"]:.1f}  hypo={m["hypo"]:.1f}  hyper={m["hyper"]:.1f}  min={m["cgm_min"]:.0f}')
         ts = os.environ.get('RUN_TS') or datetime.now().strftime('%Y%m%d_%H%M%S')
         outdir = f'bash_results/result_all/results_at_{ts}'; os.makedirs(outdir, exist_ok=True)
+        tdd = sum(m['ins_trace']) * 5.0
+        foot = {'tir': m['tir'], 'tir_base': base['tir'], 'hypo': m['hypo'],
+                'sev_hypo': m['sev_hypo'], 'hyper': m['hyper'], 'cgm_min': m['cgm_min'],
+                'cgm_mean': m['cgm_mean'], 'cgm_max': m['cgm_max'], 'tdd': tdd}
         fig = plot_results({'cgm': m['cgm_trace'], 'insulin': m['ins_trace'],
                             'infos': m['infos'], 'bg_target': m['bg_target']}, a.patient_id,
-                           cmd=f'python hybrid_policy.py --supervisor --patient_id {a.patient_id} --model {a.model}  [LTI+RL knob]')
+                           cmd=f'python hybrid_policy.py --supervisor --patient_id {a.patient_id} --model {a.model}  [LTI+RL knob]',
+                           metrics=foot)
         fname = f'{outdir}/supervisor_{a.model}_{ts}_p{a.patient_id}.png'
         fig.savefig(fname, dpi=150, bbox_inches='tight')
         print(f'Plot saved to {fname}')
+        sfile = _append_summary(outdir,
+            f'p{a.patient_id:<2}: MPC-only TIR={base["tir"]:5.1f} -> +RL TIR={m["tir"]:5.1f} | '
+            f'sevHypo={m["sev_hypo"]:4.1f} hypo={m["hypo"]:4.1f} hyper={m["hyper"]:5.1f} | '
+            f'min={m["cgm_min"]:3.0f} mean={m["cgm_mean"]:3.0f} max={m["cgm_max"]:3.0f} | TDD={tdd:5.1f}U',
+            header=f'# LTI+RL supervisor (model={a.model}) - one line per patient\n'
+                   f'# columns: TIR(70-180) | sevHypo(<54) hypo(<70) hyper(>180) | CGM min/mean/max | TDD(U/day)')
+        print(f'Summary appended to {sfile}')
         return
 
     #tune the MPC knobs for this patient (or use defaults)
@@ -477,12 +530,22 @@ def main():
     ts  = os.environ.get('RUN_TS') or datetime.now().strftime('%Y%m%d_%H%M%S')
     outdir = f'bash_results/result_all/results_at_{ts}'
     os.makedirs(outdir, exist_ok=True)
+    foot = {'tir': metrics['tir'], 'hypo': metrics['hypo'], 'hyper': metrics['hyper'],
+            'cgm_min': metrics['cgm_min'], 'cgm_mean': metrics['cgm_mean'],
+            'cgm_max': metrics['cgm_max'], 'tdd': total_insulin}
     fig = plot_results({'cgm': cgm, 'insulin': metrics['ins_trace'],
                         'infos': metrics['infos'], 'bg_target': metrics['bg_target']},
-                       a.patient_id, cmd=cmd + f'  [{tag.upper()}]')
+                       a.patient_id, cmd=cmd + f'  [{tag.upper()}]', metrics=foot)
     fname = f'{outdir}/{tag}_results_{ts}_p{a.patient_id}.png'
     fig.savefig(fname, dpi=150, bbox_inches='tight')
     print(f'\nPlot saved to {fname}')
+    sfile = _append_summary(outdir,
+        f'p{a.patient_id:<2} [{tag}]: TIR={metrics["tir"]:5.1f} | hypo={metrics["hypo"]:4.1f} '
+        f'hyper={metrics["hyper"]:5.1f} | min={metrics["cgm_min"]:3.0f} mean={metrics["cgm_mean"]:3.0f} '
+        f'max={metrics["cgm_max"]:3.0f} | TDD={total_insulin:5.1f}U',
+        header=f'# {tag.upper()} (model={a.model}) - one line per patient\n'
+               f'# columns: TIR(70-180) | hypo(<70) hyper(>180) | CGM min/mean/max | TDD(U/day)')
+    print(f'Summary appended to {sfile}')
 
 
 if __name__ == '__main__':

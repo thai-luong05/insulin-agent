@@ -157,7 +157,24 @@ def run_episode(mpc, env, args, pump, true_cr, prebolus_steps=PREBOLUS_STEPS):
     }
 
 
-def plot_results(eval_trace, patient_id, cmd=None):
+def _format_metrics_footer(m):
+    # stats box under the plot; ascii only so it also writes cleanly to summary.txt
+    parts = []
+    if m.get('tir_base') is not None:
+        parts.append(f"TIR 70-180:  MPC-only {m['tir_base']:.1f}%  ->  +RL {m['tir']:.1f}%")
+    else:
+        parts.append(f"TIR 70-180: {m['tir']:.1f}%")
+    parts.append(f"Hypo <70: {m['hypo']:.1f}%")
+    if m.get('sev_hypo') is not None:
+        parts.append(f"SevHypo <54: {m['sev_hypo']:.1f}%")
+    parts.append(f"Hyper >180: {m['hyper']:.1f}%")
+    parts.append(f"CGM min/mean/max: {m['cgm_min']:.0f}/{m['cgm_mean']:.0f}/{m['cgm_max']:.0f}")
+    if m.get('tdd') is not None:
+        parts.append(f"TDD: {m['tdd']:.1f} U/day")
+    return '      |      '.join(parts)
+
+
+def plot_results(eval_trace, patient_id, cmd=None, metrics=None):
     cgm   = eval_trace['cgm']
     ins   = eval_trace['insulin']
     infos = eval_trace['infos']
@@ -208,7 +225,13 @@ def plot_results(eval_trace, patient_id, cmd=None):
 
     title = cmd if cmd else f'MPC Glucose Regulation — Patient {patient_id}'
     plt.suptitle(title, fontsize=10, fontweight='bold')
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    if metrics:
+        fig.text(0.5, 0.015, _format_metrics_footer(metrics), ha='center', va='bottom',
+                 fontsize=10, family='monospace',
+                 bbox=dict(boxstyle='round', facecolor='#eef3ee', edgecolor='0.6'))
+        fig.tight_layout(rect=[0, 0.06, 1, 0.97])
+    else:
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
     return fig
 
 
