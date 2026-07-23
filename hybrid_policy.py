@@ -319,7 +319,7 @@ def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rn
     base_target  = mpc.bg_target
     X = I = 0.0; bolus_q = 0.0; bolused = set(); iob = 0.0
     cgm_now = cgm0; prev_cgm = cgm0
-    rows, prev = [], None
+    rows, prev, failed = [], None, False
     cgm_tr, ins_tr, infos = [], [], []
     for step in range(288):
         for idx, (ms, ma) in enumerate(zip(meal_steps, meal_amounts)):
@@ -359,6 +359,8 @@ def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rn
             if cgm_now < 40.0 or cgm_now > 450.0:                    # medical-emergency terminal
                 rows.append((s, a.astype(np.float32), np.float32(r - 100.0), s, 1.0)); prev = None; break
             prev = (s, a.astype(np.float32), np.float32(r))
+        elif cgm_now <= 40.0 or cgm_now >= 600.0:      # eval terminal: mark fail, stop
+            failed = True; break
     if knob_net is None:
         if prev is not None:
             rows.append((prev[0], prev[1], prev[2], s, 1.0))
@@ -367,7 +369,8 @@ def run_supervisor_episode(patient_id, knob_net=None, seed=0, overrides=None, rn
     return {'tir': float(np.mean((70 <= c) & (c <= 180)) * 100), 'hypo': float(np.mean(c < 70) * 100),
             'sev_hypo': float(np.mean(c < 54) * 100), 'hyper': float(np.mean(c > 180) * 100),
             'cgm_min': float(c.min()), 'cgm_max': float(c.max()), 'cgm_mean': float(c.mean()),
-            'cgm_trace': cgm_tr, 'ins_trace': ins_tr, 'infos': infos, 'bg_target': mpc.bg_target}
+            'cgm_trace': cgm_tr, 'ins_trace': ins_tr, 'infos': infos, 'bg_target': mpc.bg_target,
+            'failed': failed, 'ep_len': len(cgm_tr)}
 
 
 def train_supervisor(patient_id, out, overrides, seeds=40, steps=40000, model='lti'):
@@ -426,6 +429,138 @@ def _append_summary(outdir, line, header=None):
     return path
 
 
+def _risk_index(cgm):
+    # kovatchev lbgi/hbgi/ri, same as g2p2c new_risk_index
+    bg = np.asarray(cgm, dtype=float).copy(); bg[bg < 1] = 1
+    f = 1.509 * (np.log(bg) ** 1.084 - 5.381)
+    rl = 10 * f[f < 0] ** 2; rh = 10 * f[f > 0] ** 2
+    lbgi = float(np.nan_to_num(np.mean(rl))) if rl.size else 0.0
+    hbgi = float(np.nan_to_num(np.mean(rh))) if rh.size else 0.0
+    return lbgi, hbgi, lbgi + hbgi
+
+
+def graded_metrics(cgm):
+    # graded consensus bands: <=54 S_hypo, 54-70 hypo, 70-180 normo, 180-250 hyper, >250 S_hyper
+    c = np.asarray(cgm, dtype=float)
+    lbgi, hbgi, ri = _risk_index(c)
+    return {'normo':   float(np.mean((c > 70) & (c <= 180)) * 100),
+            'hypo':    float(np.mean((c > 54) & (c <= 70)) * 100),
+            'hyper':   float(np.mean((c > 180) & (c <= 250)) * 100),
+            'S_hypo':  float(np.mean(c <= 54) * 100),
+            'S_hyper': float(np.mean(c > 250) * 100),
+            'LBGI': lbgi, 'HBGI': hbgi, 'RI': ri}
+
+
+def render_table_png(csv_path, out_png, title=None, highlight=()):
+    # csv -> table image
+    import csv as _csv
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    rows = list(_csv.reader(open(csv_path)))
+    header, body = rows[0], rows[1:]
+    ncol, nrow = len(header), len(body)
+    fig, ax = plt.subplots(figsize=(min(2 + ncol * 1.15, 22), 1.1 + nrow * 0.4))
+    ax.axis('off')
+    tbl = ax.table(cellText=body, colLabels=header, cellLoc='center', loc='center')
+    tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1, 1.4)
+    for j in range(ncol):                                    # header row
+        c = tbl[0, j]; c.set_facecolor('#40466e'); c.set_text_props(color='w', weight='bold')
+    for i, r in enumerate(body, start=1):                    # zebra + highlight our rows
+        base = '#f5f7fa' if i % 2 else '#ffffff'
+        for j in range(ncol):
+            tbl[i, j].set_facecolor('#fff3cd' if r[0] in highlight else base)
+    if title:
+        ax.set_title(title, fontweight='bold', pad=14)
+    fig.tight_layout(); fig.savefig(out_png, dpi=150, bbox_inches='tight'); plt.close(fig)
+    return out_png
+
+
+def validate_cohort(cohort, mode, model='lti', sup_seeds=40, sup_steps=40000, n_val=500, val_start=1000, tune=True):
+    # validate one controller (mpc = neutral knobs; supervisor = trained rl) over a cohort.
+    # tune=True uses the per-patient hill-climb base. grand-mean over all patient x seed episodes.
+    import csv as _csv
+    from datetime import datetime
+    from meta_rl import default_overrides, tune_patient
+    assert mode in ('mpc', 'supervisor')
+    label = 'LTI-MPC+Sup' if mode == 'supervisor' else 'LTI-MPC'
+    pools = {'adolescent': range(0, 10), 'child': range(10, 20), 'adult': range(20, 30)}
+    ids = list(pools[cohort])
+    if val_start < sup_seeds:
+        val_start = sup_seeds                        # keep validation seeds unseen
+    ts = os.environ.get('RUN_TS') or datetime.now().strftime('%Y%m%d_%H%M%S')
+    outdir = f'cohort_results/{cohort}_{mode}_{ts}'; os.makedirs(outdir, exist_ok=True)
+    logf = open(f'{outdir}/validation_log.txt', 'w', encoding='utf-8')
+    def log(msg):
+        print(msg, flush=True); logf.write(msg + '\n'); logf.flush()
+    keys = ['normo', 'hypo', 'hyper', 'S_hypo', 'S_hyper', 'LBGI', 'HBGI', 'RI', 'fail']
+    meanrows = lambda rr: {k: round(float(np.mean([r[k] for r in rr])), 2) for k in keys}
+    log(f'cohort validation: {cohort} | controller {label} ({mode}) | patients {ids} | model {model}')
+    if mode == 'supervisor':
+        log(f'collect {sup_seeds} seeds (0..{sup_seeds - 1}) | validate {n_val} unseen seeds '
+            f'({val_start}..{val_start + n_val - 1})')
+    else:
+        log(f'validate {n_val} seeds ({val_start}..{val_start + n_val - 1}) | pure MPC, no training')
+    log(f'MPC base: {"per-patient hill-climb (tune_patient)" if tune else "population defaults"}')
+    log(f'started {datetime.now():%Y-%m-%d %H:%M:%S}')
+    log('-' * 92)
+    neutral = lambda st: torch.from_numpy(_SUP_NEUT_A).float().unsqueeze(0).expand(st.shape[0], -1)
+    per_ep, pp = [], {}                              # flat episodes -> grand mean; per-patient means
+    for pid in ids:
+        if tune:
+            log(f'p{pid}: tuning MPC (hill-climb)...')
+            ov = tune_patient(pid, seed=0, model=model)
+        else:
+            ov = default_overrides(pid)
+        if mode == 'supervisor':
+            polf = f'freestyle_rl/supervisor_p{pid}.pt'
+            log(f'p{pid}: training ({sup_seeds} seeds, {sup_steps} steps)...')
+            train_supervisor(pid, polf, ov, seeds=sup_seeds, steps=sup_steps, model=model)
+            ck = torch.load(polf, map_location='cpu')
+            act = SupActor(ck['sdim']); act.load_state_dict(ck['actor']); act.eval()
+            mean, std = ck['mean'], ck['std']
+            net = lambda st, _a=act, _m=mean, _s=std: _a((st - _m) / _s)
+        else:
+            net = neutral
+        p_ep = []
+        for k in range(n_val):
+            m = run_supervisor_episode(pid, knob_net=net, seed=val_start + k, overrides=ov, model=model)
+            g = graded_metrics(m['cgm_trace']); g['fail'] = 100.0 if m.get('failed') else 0.0
+            p_ep.append(g); per_ep.append(g)
+        pp[pid] = meanrows(p_ep)
+        log(f'  p{pid} done ({n_val} seeds): normo={pp[pid]["normo"]} S_hypo={pp[pid]["S_hypo"]} '
+            f'S_hyper={pp[pid]["S_hyper"]} RI={pp[pid]["RI"]} fail={pp[pid]["fail"]}')
+    grand = meanrows(per_ep)
+    log('-' * 92)
+    log(f'COHORT GRAND MEAN [{label}] (pooled over all patient x seed episodes):')
+    log('  ' + '  '.join(f'{k}={grand[k]}' for k in keys))
+    log(f'finished {datetime.now():%Y-%m-%d %H:%M:%S}')
+
+    # per-patient tracking spreadsheet
+    with open(f'{outdir}/{cohort}_per_patient.csv', 'w', newline='') as f:
+        w = _csv.writer(f); w.writerow(['patient', 'controller'] + keys)
+        for pid in ids:
+            w.writerow([pid, label] + [pp[pid][k] for k in keys])
+
+    # benchmark rows from {cohort}.csv + our row
+    cols = ['algo', 'normo', 'hypo', 'hyper', 'S_hypo', 'S_hyper', 'LBGI', 'HBGI', 'RI', 'reward', 'fail']
+    keep = []
+    if os.path.exists(f'{cohort}.csv'):
+        keep = [r for r in _csv.DictReader(open(f'{cohort}.csv')) if r['algo'] != label]
+    with open(f'{outdir}/{cohort}_comparison.csv', 'w', newline='') as f:
+        w = _csv.DictWriter(f, fieldnames=cols); w.writeheader()
+        for r in keep:
+            w.writerow({c: r.get(c, '') for c in cols})
+        row = {'algo': label, 'reward': ''}; row.update(grand)
+        w.writerow({c: row.get(c, '') for c in cols})
+    render_table_png(f'{outdir}/{cohort}_comparison.csv', f'{outdir}/{cohort}_comparison.png',
+                     title=f'{cohort} — {label} vs G2P2C benchmark', highlight=(label,))
+    render_table_png(f'{outdir}/{cohort}_per_patient.csv', f'{outdir}/{cohort}_per_patient.png',
+                     title=f'{cohort} — per-patient ({label})')
+    log(f'spreadsheet  -> {outdir}/{cohort}_comparison.csv  (+ .png table)')
+    log(f'per-patient  -> {outdir}/{cohort}_per_patient.csv  (+ .png table)')
+    logf.close()
+
+
 def main():
     import argparse
     from datetime import datetime
@@ -448,10 +583,20 @@ def main():
                     help='LTI+RL: RL sets the MPC aggressiveness knob (ISF mult); the MPC doses safely')
     ap.add_argument('--sup_seeds', type=int, default=40)
     ap.add_argument('--sup_steps', type=int, default=40000)
+    ap.add_argument('--cohort', choices=['adolescent', 'child', 'adult'], default=None,
+                    help='validate a whole cohort: train each patient then grand-mean over unseen seeds')
+    ap.add_argument('--n_val', type=int, default=500, help='validation episodes per patient (unseen seeds)')
+    ap.add_argument('--val_start', type=int, default=1000, help='first validation seed (kept > sup_seeds)')
     a = ap.parse_args()
 
     if a.selftest:
         _selftest(); return
+
+    if a.cohort:
+        mode = 'supervisor' if a.supervisor else 'mpc'   # --supervisor picks which controller to validate
+        validate_cohort(a.cohort, mode, model=a.model, sup_seeds=a.sup_seeds, sup_steps=a.sup_steps,
+                        n_val=a.n_val, val_start=a.val_start, tune=not a.no_tune)
+        return
 
     if a.supervisor:
         from meta_rl import default_overrides
